@@ -140,20 +140,20 @@ class PersonaMeetBot:
             # Join the meeting
             await self._click_join()
 
+            self.bot_active = True
+            log("Bot is now active — recording meeting audio")
+
+            # Start monitoring immediately so instant meeting end/rejection is caught
+            monitor_task = asyncio.create_task(self._monitor_meeting_end())
+
             # Start recording immediately after clicking join
             log("Starting audio recording...")
             await asyncio.sleep(3)
             await self._start_recording()
 
-            self.bot_active = True
-            log("Bot is now active — recording meeting audio")
-
-            # Run post-join setup, speech, and meeting-end monitor concurrently
-            # so monitor can detect "can't join" during the stabilization wait
-            await asyncio.gather(
-                self._post_join_flow(),
-                self._monitor_meeting_end(),
-            )
+            # Run post-join setup while monitor continues in parallel
+            await self._post_join_flow()
+            await monitor_task
 
             await self._stop_and_save_recording()
             log("Session complete")
@@ -382,7 +382,12 @@ class PersonaMeetBot:
     # ─── Recording ───────────────────────────────────────────
 
     async def _start_recording(self):
+        if not self.bot_active:
+            return
+
         for attempt in range(30):
+            if not self.bot_active:
+                return
             try:
                 started = await self.page.evaluate("() => window.__personaMeetBot.startRecording()")
                 if started:
@@ -420,7 +425,7 @@ class PersonaMeetBot:
                 return
 
             # Schedule bot speech
-            await self._schedule_bot_speech()
+            # await self._schedule_bot_speech()
         except Exception:
             pass
 
@@ -498,6 +503,7 @@ class PersonaMeetBot:
                 if last_url != current_url:
                     if not current_url.startswith("https://meet.google.com/") or "/landing" in current_url:
                         log("Meeting ended (navigated away)")
+                        await self._stop_and_save_recording()
                         self.bot_active = False
                         return
                     last_url = current_url
@@ -505,6 +511,10 @@ class PersonaMeetBot:
             except Exception:
                 # Page closed or context destroyed
                 log("Meeting ended (browser closed)")
+                try:
+                    await self._stop_and_save_recording()
+                except Exception:
+                    pass
                 self.bot_active = False
                 return
 
