@@ -9,17 +9,21 @@ import shutil
 import base64
 import signal
 import argparse
+import time
 from datetime import datetime
 from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 
+from meeting_pipeline import MeetingProcessingPipeline, PipelineConfig
 from inject_scripts import (
     STEALTH_SCRIPT,
     INIT_SCRIPT,
     JS_FIND_TOGGLE,
     JS_DISMISS_POPUPS,
     JS_FIND_JOIN,
+    JS_OPEN_CHAT_PANEL,
+    JS_GET_CHAT_MESSAGES,
     JS_PREJOIN_DETECTED,
     JS_IS_MEETING_OVER,
 )
@@ -52,6 +56,18 @@ class PersonaMeetBot:
         self.bot_active: bool = False
         self.recording_active: bool = False
         self._audio_data: bytes = None
+        self._audio_data_url: str | None = None
+        self.chat_messages: list[dict] = []
+        self._chat_seen_keys: set[tuple[str | None, str, str | None]] = set()
+        self._chat_capture_task = None
+        self.session_started_monotonic: float | None = None
+        self.session_dir = os.path.join(
+            os.getcwd(),
+            f"meeting-session-{datetime.now().strftime('%Y-%m-%dT%H-%M-%S')}"
+        )
+        self.recording_path: str | None = None
+        self.pipeline_outputs: dict | None = None
+        self._post_process_started: bool = False
 
     # ─── Profile management ───────────────────────────────────
 
@@ -109,6 +125,9 @@ class PersonaMeetBot:
             log_error(f"Invalid Meet URL: {self.meet_url}")
             return
 
+        self.session_started_monotonic = time.monotonic()
+        os.makedirs(self.session_dir, exist_ok=True)
+
         has_audio = self.audio_file and os.path.exists(self.audio_file)
         if not has_audio:
             log("Warning: audio file not found — will join and record but won't play audio")
@@ -118,6 +137,7 @@ class PersonaMeetBot:
         log(f"  URL     : {self.meet_url}")
         log(f"  Name    : {self.bot_name}")
         log(f"  Audio   : {self.audio_file if has_audio else 'N/A'}")
+        log(f"  Output  : {self.session_dir}")
         log(f"  Profile : {self.user_data_dir or 'ephemeral'}")
         log("=" * 60)
 
@@ -126,6 +146,10 @@ class PersonaMeetBot:
             await self._launch_browser()
             await self._setup_page()
             await self._navigate_to_meet()
+
+            # Pre-load Whisper model in background so it's cached before the meeting ends.
+            # This way post-meeting transcription starts instantly instead of downloading then.
+            whisper_preload_task = asyncio.create_task(self._preload_whisper_model())
 
             # Pre-join flow
             await self._wait_for_prejoin_ui()
@@ -156,17 +180,34 @@ class PersonaMeetBot:
             await monitor_task
 
             await self._stop_and_save_recording()
+            await self._run_post_meeting_pipeline()
             log("Session complete")
 
-        except Exception as e:
-            log_error(f"Bot error: {e}")
+        except BaseException as e:
+            if isinstance(e, KeyboardInterrupt):
+                log("Interrupted by user — attempting graceful shutdown and post-processing...")
+            else:
+                log_error(f"Bot error: {e}")
             import traceback
             traceback.print_exc()
             try:
                 await self._stop_and_save_recording()
             except Exception:
                 pass
+            try:
+                await self._run_post_meeting_pipeline()
+            except Exception:
+                pass
         finally:
+            # Final safety net: if recording exists, still try pipeline before cleanup.
+            try:
+                await self._stop_and_save_recording()
+            except Exception:
+                pass
+            try:
+                await self._run_post_meeting_pipeline()
+            except Exception:
+                pass
             await self._cleanup()
 
     # ─── Browser launch ──────────────────────────────────────
@@ -421,6 +462,9 @@ class PersonaMeetBot:
             await asyncio.sleep(0.5)
             await self._disable_with_retry("camera", 5)
 
+            await self._open_chat_panel()
+            self._chat_capture_task = asyncio.create_task(self._capture_chat_messages())
+
             if not self.bot_active:
                 return
 
@@ -488,13 +532,22 @@ class PersonaMeetBot:
 
     async def _monitor_meeting_end(self):
         last_url = self.page.url
+        end_signal_hits = 0
 
         while self.bot_active:
             try:
                 # Check for end-of-meeting or rejection UI
                 if await self.page.evaluate(JS_IS_MEETING_OVER):
+                    end_signal_hits += 1
+                else:
+                    end_signal_hits = 0
+
+                # Require repeated confirmation to avoid false positives from transient page text.
+                if end_signal_hits >= 2:
                     log("Meeting ended — saving recording before page navigates away")
                     await self._stop_and_save_recording()
+                    await self._close_browser_runtime()
+                    await self._run_post_meeting_pipeline()
                     self.bot_active = False
                     return
 
@@ -504,6 +557,8 @@ class PersonaMeetBot:
                     if not current_url.startswith("https://meet.google.com/") or "/landing" in current_url:
                         log("Meeting ended (navigated away)")
                         await self._stop_and_save_recording()
+                        await self._close_browser_runtime()
+                        await self._run_post_meeting_pipeline()
                         self.bot_active = False
                         return
                     last_url = current_url
@@ -513,12 +568,26 @@ class PersonaMeetBot:
                 log("Meeting ended (browser closed)")
                 try:
                     await self._stop_and_save_recording()
+                    await self._run_post_meeting_pipeline()
                 except Exception:
                     pass
                 self.bot_active = False
                 return
 
             await asyncio.sleep(2)
+
+    async def _close_browser_runtime(self):
+        """Close browser early when meeting ends so user does not have to close it manually."""
+        try:
+            if self.context:
+                await self.context.close()
+        except Exception:
+            pass
+        try:
+            if self.browser:
+                await self.browser.close()
+        except Exception:
+            pass
 
     # ─── Save recording ─────────────────────────────────────
 
@@ -539,11 +608,12 @@ class PersonaMeetBot:
 
                 ts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
                 filename = f"meeting-recording-{ts}.webm"
-                filepath = os.path.join(os.getcwd(), filename)
+                filepath = os.path.join(self.session_dir, filename)
 
                 with open(filepath, "wb") as f:
                     f.write(audio_bytes)
 
+                self.recording_path = filepath
                 log(f"Recording saved: {filename} ({len(audio_bytes) / 1024:.1f} KB)")
             else:
                 log("No audio data captured")
@@ -553,9 +623,112 @@ class PersonaMeetBot:
 
         self.recording_active = False
 
+    async def _open_chat_panel(self):
+        try:
+            await asyncio.sleep(2)
+            opened = await self.page.evaluate(JS_OPEN_CHAT_PANEL)
+            if opened:
+                log("Chat panel opened")
+        except Exception:
+            pass
+
+    async def _capture_chat_messages(self):
+        while self.bot_active:
+            try:
+                messages = await self.page.evaluate(JS_GET_CHAT_MESSAGES)
+                if isinstance(messages, list):
+                    self._merge_chat_messages(messages)
+            except Exception:
+                pass
+            await asyncio.sleep(4)
+
+    def _merge_chat_messages(self, messages: list[dict]):
+        now_relative = None
+        if self.session_started_monotonic is not None:
+            now_relative = max(0.0, time.monotonic() - self.session_started_monotonic)
+
+        for item in messages:
+            text = (item.get("text") or "").strip()
+            author = (item.get("author") or "").strip() or None
+            captured_at = item.get("captured_at")
+            if not text:
+                continue
+
+            key = (author, text, captured_at)
+            if key in self._chat_seen_keys:
+                continue
+
+            self._chat_seen_keys.add(key)
+            self.chat_messages.append(
+                {
+                    "author": author,
+                    "text": text,
+                    "captured_at": captured_at,
+                    "relative_seconds": now_relative,
+                }
+            )
+
+    async def _preload_whisper_model(self):
+        """Download / warm-up the local Whisper model in the background while the
+        meeting is in progress so that post-meeting transcription starts instantly."""
+        config = PipelineConfig(base_dir=self.session_dir)
+        if config.openai_api_key or config.gemini_api_key:
+            return  # API backend — nothing to pre-load locally
+
+        model_size = config.local_whisper_model
+        log(f"Pre-loading Whisper model '{model_size}' in background (downloads once if not cached)...")
+        try:
+            await asyncio.to_thread(self._load_whisper_model, model_size)
+            log(f"Whisper model '{model_size}' ready.")
+        except Exception as exc:
+            log(f"Warning: Whisper pre-load failed ({exc}). Will retry during post-processing.")
+
+    @staticmethod
+    def _load_whisper_model(model_size: str):
+        """Blocking call — runs in a thread. Loads (and caches) the faster-whisper model."""
+        from faster_whisper import WhisperModel
+        WhisperModel(model_size, device="cpu", compute_type="int8")
+
+    async def _run_post_meeting_pipeline(self):
+        if self._post_process_started or not self.recording_path:
+            return
+
+        self._post_process_started = True
+        log("Starting post-meeting processing pipeline (transcription + report). This can take 1-3 minutes.")
+
+        config = PipelineConfig(base_dir=self.session_dir)
+        pipeline = MeetingProcessingPipeline(config)
+        metadata = {
+            "meet_url": self.meet_url,
+            "bot_name": self.bot_name,
+        }
+
+        try:
+            # Shield so Ctrl+C cancellation does not abort processing midway.
+            self.pipeline_outputs = await asyncio.shield(
+                asyncio.to_thread(
+                    pipeline.process,
+                    self.recording_path,
+                    self.chat_messages,
+                    metadata,
+                )
+            )
+            log(f"Transcript saved: {self.pipeline_outputs['transcript_path']}")
+            log(f"Report saved: {self.pipeline_outputs['report_path']}")
+        except Exception as e:
+            log_error(f"Post-meeting processing failed: {e}")
+            log_error("If running without OPENAI_API_KEY, ensure faster-whisper is installed and wait for model download on first run.")
+
     # ─── Cleanup ─────────────────────────────────────────────
 
     async def _cleanup(self):
+        if self._chat_capture_task:
+            self._chat_capture_task.cancel()
+            try:
+                await self._chat_capture_task
+            except BaseException:
+                pass
+
         # Close the browser
         try:
             if self.context:

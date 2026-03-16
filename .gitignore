@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Playwright / browser profiles / local runtime data
+playwright-report/
+user_login/
+
+# PersonaMeet generated meeting outputs
+meeting-session-*/
+*.webm
+*.wav
+*.mp3
+pipeline_error.txt
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -11,6 +11,8 @@ Contains:
   - JS_FIND_TOGGLE    : Finds mic/camera toggle buttons and returns their state & position
   - JS_DISMISS_POPUPS : Dismisses popups / dialogs that block the join flow
   - JS_FIND_JOIN      : Finds the "Join Now" / "Ask to Join" button
+    - JS_OPEN_CHAT_PANEL : Opens the Google Meet chat panel when available
+    - JS_GET_CHAT_MESSAGES : Reads visible chat messages from the chat panel
   - JS_PREJOIN_DETECTED : Detects whether the pre-join UI is visible
   - JS_IS_MEETING_OVER  : Detects meeting-end text on the page
 """
@@ -574,6 +576,73 @@ JS_FIND_JOIN = r"""
 }
 """
 
+# Open the in-meeting chat panel if the button is available
+JS_OPEN_CHAT_PANEL = r"""
+() => {
+    const candidates = document.querySelectorAll('button, [role="button"]');
+    for (const el of candidates) {
+        const label = [
+            el.getAttribute('aria-label') || '',
+            el.getAttribute('data-tooltip') || '',
+            el.getAttribute('title') || '',
+            el.innerText || '',
+        ].join(' ').toLowerCase();
+
+        if (!label.includes('chat')) continue;
+        if (label.includes('chat with everyone') || label.includes('open chat') || label === 'chat') {
+            el.click();
+            return true;
+        }
+    }
+    return false;
+}
+"""
+
+# Read visible chat messages from the opened chat panel
+JS_GET_CHAT_MESSAGES = r"""
+() => {
+    const messages = [];
+    const seen = new Set();
+    const selectors = [
+        '[role="listitem"]',
+        '[data-message-id]',
+        '[data-chat-message-id]',
+    ];
+
+    for (const selector of selectors) {
+        for (const el of document.querySelectorAll(selector)) {
+            const text = (el.innerText || '').trim();
+            if (!text || text.length < 2) continue;
+
+            const lowered = text.toLowerCase();
+            if (lowered.includes('send a message') || lowered.includes('chat with everyone')) continue;
+
+            const lines = text.split(/\n+/).map(item => item.trim()).filter(Boolean);
+            if (!lines.length) continue;
+
+            let author = null;
+            let body = text;
+            if (lines.length >= 2) {
+                author = lines[0];
+                body = lines.slice(1).join(' ');
+            }
+
+            const key = `${author || ''}|${body}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+
+            messages.push({
+                author,
+                text: body,
+                captured_at: new Date().toISOString(),
+            });
+        }
+    }
+
+    return messages.slice(-200);
+}
+"""
+
 # Check whether the pre-join UI is visible (mic/camera toggles, join button, OR name input)
 JS_PREJOIN_DETECTED = r"""
 () => {
@@ -605,15 +674,17 @@ JS_PREJOIN_DETECTED = r"""
 # Meeting-end detection (mirrors inject.js isMeetingOver)
 JS_IS_MEETING_OVER = r"""
 () => {
-    const text = (document.body && document.body.innerText) || '';
+    const text = ((document.body && document.body.innerText) || '').toLowerCase();
     return (
-        text.includes('You left the meeting') ||
-        text.includes('The meeting has ended') ||
-        text.includes("You've been removed from the meeting") ||
-        text.includes('You were removed from this meeting') ||
-        text.includes('Return to home screen') ||
-        text.includes("You can't join this video call") ||
-        text.includes("can't join this video call")
+        text.includes('you left the meeting') ||
+        text.includes('the meeting has ended') ||
+        text.includes("you've been removed from the meeting") ||
+        text.includes('you were removed from this meeting') ||
+        text.includes('return to home screen') ||
+        text.includes("you can't join this video call") ||
+        text.includes("can't join this video call") ||
+        text.includes('you were removed') ||
+        text.includes('removed from this call')
     );
 }
 """
