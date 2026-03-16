@@ -1,46 +1,74 @@
-# PersonaMeet
+# PersonaMeet Agent Pipeline
 
-PersonaMeet joins a Google Meet, records meeting audio, captures chat messages, and generates post-meeting artifacts including transcript and meeting report.
+PersonaMeet is a Google Meet assistant that automatically joins meetings, records audio, captures chat, and generates post-meeting intelligence:
 
-## Features
+- full transcript
+- structured summary
+- decisions
+- action items
+- speaker highlights
 
-- Join Google Meet automatically (anonymous or logged-in profile mode)
-- Record meeting audio to `.webm`
-- Capture in-meeting chat messages
-- Transcription backend fallback chain:
-	- OpenAI Whisper API (if `OPENAI_API_KEY` is set)
-	- Gemini audio transcription (if `GEMINI_API_KEY` is set)
-	- Local `faster-whisper` model (offline fallback)
-- Meeting analysis/report backend fallback chain:
-	- OpenAI chat model (if `OPENAI_API_KEY` is set)
-	- Gemini model (if `GEMINI_API_KEY` is set)
-	- Rule-based fallback
-- Speaker tagging support (`Speaker 1`, `Speaker 2`, etc.) when direct names are unavailable
+It is built for multilingual meetings (English, Hindi, Marathi, and mixed conversations) with provider fallback logic.
+
+## What It Does
+
+1. Joins a Google Meet using Playwright automation.
+2. Records in-meeting audio to `.webm`.
+3. Captures visible chat messages.
+4. Runs a post-meeting pipeline:
+	 - transcription
+	 - analysis
+	 - report generation
+5. Writes JSON + Markdown artifacts per meeting session.
+
+## Backend Fallback Strategy
+
+### Transcription
+
+1. OpenAI Whisper API (if `OPENAI_API_KEY` is available)
+2. Gemini audio transcription (if `GEMINI_API_KEY` is available)
+3. Local `faster-whisper` fallback
+
+### Analysis and Report Generation
+
+1. OpenAI chat model (if `OPENAI_API_KEY` is available)
+2. Gemini model (if `GEMINI_API_KEY` is available)
+3. Rule-based fallback extraction
+
+### Speaker Labels
+
+If direct speaker names are not available, the pipeline assigns synthetic labels like `Speaker 1`, `Speaker 2` using turn-based segmentation.
 
 ## Project Structure
 
-```
+```text
 persona_meet/
 	persona_meet_bot.py
 	inject_scripts.py
 	login_profile.py
 	requirements.txt
+	.env.example
+	.gitignore
+	scripts/
+		setup.sh
+		setup.ps1
 	meeting_pipeline/
+		__init__.py
+		config.py
+		models.py
 		transcription.py
 		analyzer.py
 		reporting.py
 		pipeline.py
-		models.py
-		config.py
 ```
 
-## Prerequisites
+## Quick Start
+
+### Prerequisites
 
 - Python 3.10+
-- Chromium (installed via Playwright)
-- Windows/Linux/macOS terminal
-
-## Setup
+- Git Bash or PowerShell
+- Chromium (installed through Playwright step)
 
 ### Option A: One-command setup (recommended)
 
@@ -58,16 +86,12 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1
 
 ### Option B: Manual setup
 
-1. Install dependencies:
-
 ```bash
 pip install -r requirements.txt
 playwright install chromium
 ```
 
-2. Configure environment variables:
-
-Copy `.env.example` values into your shell environment (or your own `.env` workflow).
+Copy `.env.example` values into your environment.
 
 Git Bash example:
 
@@ -85,23 +109,7 @@ $env:GEMINI_API_KEY=""
 $env:PERSONA_LOCAL_WHISPER_MODEL="small"
 ```
 
-3. Optional: Save a logged-in Chrome profile for meetings requiring admission from an account:
-
-```bash
-python login_profile.py
-```
-
-## Publish To Existing Repo
-
-If your local folder is already cloned from the target repository:
-
-```bash
-git add .
-git commit -m "Add meeting pipeline, Gemini fallback, speaker labels, and setup scripts"
-git push origin main
-```
-
-## Run
+## Running The Bot
 
 Anonymous mode:
 
@@ -112,12 +120,17 @@ python persona_meet_bot.py "https://meet.google.com/abc-defg-hij" --name "Meetin
 Logged-in profile mode:
 
 ```bash
+python login_profile.py
 python persona_meet_bot.py "https://meet.google.com/abc-defg-hij" --profile user_login
 ```
 
-## Output
+## Output Artifacts
 
-Each run creates a session folder named like `meeting-session-2026-03-16T10-30-00` containing:
+Each run creates a folder like:
+
+`meeting-session-2026-03-16T10-30-00`
+
+Inside it:
 
 - `meeting-recording-*.webm`
 - `chat_messages.json`
@@ -126,25 +139,56 @@ Each run creates a session folder named like `meeting-session-2026-03-16T10-30-0
 - `meeting_analysis.json`
 - `meeting_report.md`
 
-On pipeline failures, error artifacts are generated:
+If anything fails in post-processing:
 
 - `pipeline_error.txt`
 - fallback `meeting_report.md` with error status
 
-## Environment Variables
+## Configuration
 
-- `OPENAI_API_KEY`: enables OpenAI transcription + analysis
-- `GEMINI_API_KEY`: enables Gemini transcription + analysis fallback
-- `PERSONA_GEMINI_MODEL` (default: `gemini-1.5-flash`)
+### API Keys
+
+- `OPENAI_API_KEY`
+- `GEMINI_API_KEY`
+
+### Model Selection
+
 - `PERSONA_TRANSCRIPTION_MODEL` (default: `whisper-1`)
 - `PERSONA_SUMMARY_MODEL` (default: `gpt-4o-mini`)
+- `PERSONA_GEMINI_MODEL` (default: `gemini-1.5-flash`)
 - `PERSONA_LOCAL_WHISPER_MODEL` (default: `small`)
+
+### Local Whisper Performance
+
 - `PERSONA_LOCAL_WHISPER_BEAM_SIZE` (default: `2`)
 - `PERSONA_LOCAL_WHISPER_CPU_THREADS` (default: CPU count)
+
+### Speaker Segmentation
+
 - `PERSONA_SYNTHETIC_SPEAKER_COUNT` (default: `2`)
 - `PERSONA_SPEAKER_TURN_GAP_SECONDS` (default: `1.6`)
 
-## Notes
+## Accuracy and Speed Notes
 
-- Do not commit API keys. Keep them in environment variables.
-- If you accidentally exposed a key, revoke and rotate it immediately.
+- Best quality for Hindi/Marathi: API backends (OpenAI/Gemini).
+- Local transcription is fully offline but can be slower and less accurate for multilingual speech.
+- `small` is a good local default. `medium` improves quality but increases runtime.
+
+## Troubleshooting
+
+- `429 insufficient_quota` from OpenAI:
+	- Your OpenAI credits are exhausted.
+	- Add credits or set `GEMINI_API_KEY` so pipeline falls back to Gemini.
+
+- Very slow local transcription:
+	- Use API backend keys, or tune local settings (`PERSONA_LOCAL_WHISPER_BEAM_SIZE`, `PERSONA_LOCAL_WHISPER_CPU_THREADS`).
+
+- Report generated but content quality is poor:
+	- Prefer API backends for multilingual meetings.
+	- Ensure meeting audio is clearly captured (not muted/silent).
+
+## Security
+
+- Never commit real API keys.
+- Keep secrets in environment variables or local `.env` only.
+- If a key is leaked, revoke and rotate immediately.
