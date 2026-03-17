@@ -226,6 +226,80 @@ class AudioTranscriber:
             return data.get("result") or data
         return data
 
+    @staticmethod
+    def _extract_seconds_field(payload: dict, keys: list[str]) -> float | None:
+        for key in keys:
+            if key not in payload:
+                continue
+            raw_value = payload.get(key)
+            if raw_value in (None, ""):
+                continue
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+            if key.lower().endswith("ms"):
+                value /= 1000.0
+            if value < 0:
+                value = 0.0
+            return value
+        return None
+
+    @staticmethod
+    def _probe_audio_duration_seconds(audio_path: Path) -> float | None:
+        try:
+            import av
+        except ImportError:
+            return None
+
+        try:
+            container = av.open(str(audio_path))
+        except Exception:
+            return None
+
+        try:
+            if container.duration:
+                duration = float(container.duration) / 1_000_000.0
+                if duration > 0:
+                    return duration
+
+            audio_streams = [s for s in container.streams if s.type == "audio"]
+            if audio_streams:
+                stream = audio_streams[0]
+                if stream.duration is not None and stream.time_base is not None:
+                    duration = float(stream.duration * stream.time_base)
+                    if duration > 0:
+                        return duration
+        except Exception:
+            return None
+
+        return None
+
+    def _assign_even_timestamps(self, segments: list[TranscriptSegment], audio_path: Path) -> list[TranscriptSegment]:
+        if not segments:
+            return segments
+
+        if any(segment.start > 0 or segment.end > segment.start for segment in segments):
+            return segments
+
+        total_duration = self._probe_audio_duration_seconds(audio_path)
+        if not total_duration or total_duration <= 0:
+            total_duration = float(len(segments) * 5)
+
+        step = max(0.8, total_duration / max(1, len(segments)))
+        cursor = 0.0
+        for idx, segment in enumerate(segments):
+            start = cursor
+            if idx == len(segments) - 1:
+                end = total_duration
+            else:
+                end = min(total_duration, start + step)
+            segment.start = round(start, 3)
+            segment.end = round(max(end, start + 0.4), 3)
+            cursor = segment.end
+
+        return segments
+
     def _parse_sarvam_payload(self, payload: dict) -> tuple[str, str | None, list[TranscriptSegment]]:
         data = self._sarvam_normalize_data(payload)
 
@@ -255,10 +329,45 @@ class AudioTranscriber:
                 or seg.get("speaker_id")
                 or ""
             )
+            start = self._extract_seconds_field(
+                seg,
+                [
+                    "start",
+                    "start_time",
+                    "start_seconds",
+                    "start_time_seconds",
+                    "start_ms",
+                    "startTime",
+                    "startTimeMs",
+                ],
+            )
+            end = self._extract_seconds_field(
+                seg,
+                [
+                    "end",
+                    "end_time",
+                    "end_seconds",
+                    "end_time_seconds",
+                    "end_ms",
+                    "endTime",
+                    "endTimeMs",
+                ],
+            )
+            duration = self._extract_seconds_field(
+                seg,
+                ["duration", "duration_seconds", "segment_duration", "duration_ms"],
+            )
+            if start is None:
+                start = 0.0
+            if end is None and duration is not None:
+                end = start + duration
+            if end is None:
+                end = start
+
             segments.append(
                 TranscriptSegment(
-                    start=float(seg.get("start") or 0.0),
-                    end=float(seg.get("end") or 0.0),
+                    start=float(start),
+                    end=float(end),
                     text=text,
                     speaker=str(speaker).strip() or None,
                 )
@@ -405,7 +514,7 @@ class AudioTranscriber:
         requested_model = (self.config.sarvam_model or "").strip()
         if not requested_model:
             raise TranscriptionError("Sarvam batch diarization requires PERSONA_SARVAM_MODEL to be set.")
-        create_job = client.speech_to_text_translate_job.create_job
+        create_job = client.speech_to_text_job.create_job
         try:
             # Newer SDK variants may support `mode`; older versions reject it.
             job = create_job(
@@ -483,12 +592,44 @@ class AudioTranscriber:
                                 or entry.get("speaker_label")
                                 or ""
                             )
-                            start = entry.get("start_time_seconds")
-                            end = entry.get("end_time_seconds")
+                            start = self._extract_seconds_field(
+                                entry,
+                                [
+                                    "start_time_seconds",
+                                    "start",
+                                    "start_time",
+                                    "start_seconds",
+                                    "start_ms",
+                                    "startTime",
+                                    "startTimeMs",
+                                ],
+                            )
+                            end = self._extract_seconds_field(
+                                entry,
+                                [
+                                    "end_time_seconds",
+                                    "end",
+                                    "end_time",
+                                    "end_seconds",
+                                    "end_ms",
+                                    "endTime",
+                                    "endTimeMs",
+                                ],
+                            )
+                            duration = self._extract_seconds_field(
+                                entry,
+                                ["duration", "duration_seconds", "segment_duration", "duration_ms"],
+                            )
+                            if start is None:
+                                start = 0.0
+                            if end is None and duration is not None:
+                                end = start + duration
+                            if end is None:
+                                end = start
                             segments.append(
                                 TranscriptSegment(
-                                    start=float(start or 0.0),
-                                    end=float(end or 0.0),
+                                    start=float(start),
+                                    end=float(end),
                                     text=text,
                                     speaker=str(speaker).strip() or None,
                                 )
@@ -511,7 +652,10 @@ class AudioTranscriber:
             if not transcript_text:
                 raise TranscriptionError("Sarvam batch diarization completed but returned no text.")
 
+            merged_segments = self._assign_even_timestamps(merged_segments, audio_path)
             merged_segments = self._ensure_speaker_labels(merged_segments)
+            if merged_segments:
+                max_end = max(segment.end for segment in merged_segments)
             return TranscriptData(
                 text=transcript_text,
                 language=language,
