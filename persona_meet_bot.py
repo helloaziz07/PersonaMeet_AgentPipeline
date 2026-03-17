@@ -24,6 +24,7 @@ from inject_scripts import (
     JS_FIND_JOIN,
     JS_OPEN_CHAT_PANEL,
     JS_GET_CHAT_MESSAGES,
+    JS_GET_PARTICIPANTS,
     JS_PREJOIN_DETECTED,
     JS_IS_MEETING_OVER,
 )
@@ -58,6 +59,7 @@ class PersonaMeetBot:
         self._audio_data: bytes = None
         self._audio_data_url: str | None = None
         self.chat_messages: list[dict] = []
+        self.participant_names: list[str] = []
         self._chat_seen_keys: set[tuple[str | None, str, str | None]] = set()
         self._chat_capture_task = None
         self.session_started_monotonic: float | None = None
@@ -463,6 +465,7 @@ class PersonaMeetBot:
             await self._disable_with_retry("camera", 5)
 
             await self._open_chat_panel()
+            await self._capture_participant_names()
             self._chat_capture_task = asyncio.create_task(self._capture_chat_messages())
 
             if not self.bot_active:
@@ -632,6 +635,37 @@ class PersonaMeetBot:
         except Exception:
             pass
 
+    async def _capture_participant_names(self):
+        try:
+            await asyncio.sleep(2)
+            names = await self.page.evaluate(JS_GET_PARTICIPANTS)
+            if not isinstance(names, list):
+                return
+
+            bot_name = (self.bot_name or "").strip().lower()
+            cleaned: list[str] = []
+            seen: set[str] = set()
+
+            for item in names:
+                name = str(item or "").strip()
+                if not name:
+                    continue
+                lower = name.lower()
+                if lower == bot_name:
+                    continue
+                if lower in seen:
+                    continue
+                seen.add(lower)
+                cleaned.append(name)
+
+            self.participant_names = cleaned
+            if cleaned:
+                log(f"Captured participants: {', '.join(cleaned)}")
+            else:
+                log("Participant names not found in UI yet.")
+        except Exception:
+            pass
+
     async def _capture_chat_messages(self):
         while self.bot_active:
             try:
@@ -672,7 +706,7 @@ class PersonaMeetBot:
         """Download / warm-up the local Whisper model in the background while the
         meeting is in progress so that post-meeting transcription starts instantly."""
         config = PipelineConfig(base_dir=self.session_dir)
-        if config.openai_api_key or config.gemini_api_key:
+        if config.sarvam_api_key or config.openai_api_key or config.gemini_api_key:
             return  # API backend — nothing to pre-load locally
 
         model_size = config.local_whisper_model
@@ -701,6 +735,7 @@ class PersonaMeetBot:
         metadata = {
             "meet_url": self.meet_url,
             "bot_name": self.bot_name,
+            "participant_names": self.participant_names,
         }
 
         try:

@@ -85,20 +85,56 @@ def _safe_json_loads(payload: str) -> dict:
 class MeetingAnalyzer:
     def __init__(self, config: PipelineConfig):
         self.config = config
+        self.last_backend: str | None = None
 
     def analyze(self, transcript: TranscriptData, chat_messages: list[ChatMessage], metadata: dict) -> MeetingReport:
         """Analyze meeting — tries OpenAI, then Gemini, then rule-based fallback."""
         if self.config.openai_api_key:
             try:
-                return self._analyze_openai(transcript, chat_messages, metadata)
+                report = self._analyze_openai(transcript, chat_messages, metadata)
+                self.last_backend = "openai"
+                return report
             except Exception as exc:
                 print(f"[Pipeline] OpenAI analysis failed ({exc}). Trying Gemini...")
         if self.config.gemini_api_key:
             try:
-                return self._analyze_gemini(transcript, chat_messages, metadata)
+                report = self._analyze_gemini(transcript, chat_messages, metadata)
+                self.last_backend = "gemini"
+                return report
             except Exception as exc:
                 print(f"[Pipeline] Gemini analysis failed ({exc}). Using rule-based fallback...")
-        return self._fallback_report(transcript, chat_messages)
+        self.last_backend = "rule-based"
+        return self._fallback_report(transcript, chat_messages, metadata)
+
+    @staticmethod
+    def _normalize_text(text: str, max_len: int = 220) -> str:
+        cleaned = re.sub(r"\s+", " ", (text or "").strip())
+        if not cleaned:
+            return ""
+
+        # Collapse obvious repeated short phrase loops (e.g. 'haan ji' repeated many times).
+        words = cleaned.split()
+        if len(words) >= 12:
+            for n in (1, 2, 3):
+                if len(words) < n * 6:
+                    continue
+                unit = words[:n]
+                repeats = 0
+                idx = 0
+                while idx + n <= len(words) and words[idx:idx + n] == unit:
+                    repeats += 1
+                    idx += n
+                if repeats >= 6:
+                    phrase = " ".join(unit)
+                    tail = " ".join(words[idx:])
+                    cleaned = f"{phrase} (repeated {repeats} times)"
+                    if tail:
+                        cleaned += f". {tail}"
+                    break
+
+        if len(cleaned) > max_len:
+            cleaned = cleaned[: max_len - 3].rstrip() + "..."
+        return cleaned
 
     # ── OpenAI analysis backend ─────────────────────────────────────────
 
@@ -300,35 +336,43 @@ class MeetingAnalyzer:
             summary_note=(payload.get("summary_note") or "").strip() or None,
         )
 
-    def _fallback_report(self, transcript: TranscriptData, chat_messages: list[ChatMessage]) -> MeetingReport:
+    def _fallback_report(self, transcript: TranscriptData, chat_messages: list[ChatMessage], metadata: dict) -> MeetingReport:
         """Rule-based extraction — runs offline with no API key required."""
 
         # Combine all text lines with timestamps
         all_lines: list[tuple[float | None, str, str]] = []  # (start, source, text)
         for segment in transcript.segments:
-            if segment.text.strip():
-                all_lines.append((segment.start, "audio", segment.text.strip()))
+            normalized = self._normalize_text(segment.text)
+            if normalized:
+                all_lines.append((segment.start, "audio", normalized))
         for message in chat_messages:
-            if message.text.strip():
-                all_lines.append((message.relative_seconds, "chat", message.text.strip()))
+            normalized = self._normalize_text(message.text)
+            if normalized:
+                all_lines.append((message.relative_seconds, "chat", normalized))
         all_lines.sort(key=lambda item: item[0] if item[0] is not None else 0)
 
         if not all_lines and transcript.text:
-            all_lines = [(None, "audio", part.strip()) for part in transcript.text.split(".") if part.strip()]
+            all_lines = [
+                (None, "audio", self._normalize_text(part))
+                for part in transcript.text.split(".")
+                if self._normalize_text(part)
+            ]
 
         # ── Chronological summary (first 20 meaningful lines) ──────────
         chronological_summary = [
             f"[{_format_seconds(ts)}] {text}" if ts is not None else text
-            for ts, _source, text in all_lines[:20]
+            for ts, _source, text in all_lines[:12]
         ]
 
         # ── Speaker highlights ──────────────────────────────────────────
         speaker_map: dict[str, list[str]] = defaultdict(list)
         for segment in transcript.segments:
-            if segment.text.strip():
+            normalized = self._normalize_text(segment.text)
+            if normalized:
                 speaker = segment.speaker or "Unknown Speaker"
                 if len(speaker_map[speaker]) < 5:
-                    speaker_map[speaker].append(segment.text.strip())
+                    if normalized not in speaker_map[speaker]:
+                        speaker_map[speaker].append(normalized)
         speaker_highlights = [
             SpeakerHighlight(speaker=spk, highlights=items)
             for spk, items in speaker_map.items()
@@ -395,12 +439,33 @@ class MeetingAnalyzer:
         if chat_messages:
             important_highlights.append(f"{len(chat_messages)} chat message(s) captured during the meeting.")
 
+        # De-duplicate highlights while preserving order.
+        dedup_highlights: list[str] = []
+        seen_highlights: set[str] = set()
+        for item in important_highlights:
+            key = item.lower().strip()
+            if not key or key in seen_highlights:
+                continue
+            seen_highlights.add(key)
+            dedup_highlights.append(item)
+        important_highlights = dedup_highlights[:8]
+
         # ── Key timestamps: first 8 segment starts ───────────────────────
         key_timestamps = [
-            f"[{_format_seconds(segment.start)}] {segment.text[:80]}"
+            f"[{_format_seconds(segment.start)}] {self._normalize_text(segment.text, max_len=100)}"
             for segment in transcript.segments[:8]
             if segment.text.strip()
         ]
+
+        transcription_backend = (metadata.get("transcription_backend") or "unknown").strip()
+        analysis_backend = (metadata.get("analysis_backend") or "rule-based").strip()
+
+        summary_note = (
+            f"Transcription backend: {transcription_backend}. "
+            f"Analysis backend: {analysis_backend}. "
+            "This report used deterministic rule-based extraction, so decisions/action items may be conservative. "
+            "Set OPENAI_API_KEY or GEMINI_API_KEY for richer, LLM-generated summaries."
+        )
 
         return MeetingReport(
             important_highlights=important_highlights,
@@ -410,8 +475,5 @@ class MeetingAnalyzer:
             action_items=action_items,
             key_timestamps=key_timestamps,
             transcript_language=transcript.language,
-            summary_note=(
-                "Report generated using local faster-whisper transcription and rule-based extraction. "
-                "Set OPENAI_API_KEY for richer LLM-based summaries with better decision and action item quality."
-            ),
+            summary_note=summary_note,
         )

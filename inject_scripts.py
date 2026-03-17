@@ -13,6 +13,7 @@ Contains:
   - JS_FIND_JOIN      : Finds the "Join Now" / "Ask to Join" button
     - JS_OPEN_CHAT_PANEL : Opens the Google Meet chat panel when available
     - JS_GET_CHAT_MESSAGES : Reads visible chat messages from the chat panel
+        - JS_GET_PARTICIPANTS : Reads visible participant names for speaker mapping
   - JS_PREJOIN_DETECTED : Detects whether the pre-join UI is visible
   - JS_IS_MEETING_OVER  : Detects meeting-end text on the page
 """
@@ -640,6 +641,49 @@ JS_GET_CHAT_MESSAGES = r"""
     }
 
     return messages.slice(-200);
+}
+"""
+
+# Read visible participant names from tiles/controls/people list when available
+JS_GET_PARTICIPANTS = r"""
+() => {
+    const names = [];
+    const seen = new Set();
+
+    function addName(name) {
+        const cleaned = (name || '').trim();
+        if (!cleaned || cleaned.length < 2 || cleaned.length > 80) return;
+        const lower = cleaned.toLowerCase();
+        if (['you', 'everyone', 'participants', 'people', 'chat'].includes(lower)) return;
+        if (seen.has(cleaned)) return;
+        seen.add(cleaned);
+        names.push(cleaned);
+    }
+
+    // Heuristic 1: aria-label patterns from mute/unmute actions
+    for (const el of document.querySelectorAll('button[aria-label], [role="button"][aria-label]')) {
+        const label = (el.getAttribute('aria-label') || '').trim();
+        const lower = label.toLowerCase();
+        if (lower.startsWith('mute ')) addName(label.slice(5));
+        if (lower.startsWith('unmute ')) addName(label.slice(7));
+    }
+
+    // Heuristic 2: participant containers
+    for (const el of document.querySelectorAll('[data-participant-id], [role="listitem"]')) {
+        const text = (el.innerText || '').split(/\n+/)[0] || '';
+        addName(text);
+    }
+
+    // Heuristic 3: generic name spans often used in tile overlays
+    for (const el of document.querySelectorAll('div[aria-label]')) {
+        const label = (el.getAttribute('aria-label') || '').trim();
+        if (!label) continue;
+        if (label.toLowerCase().includes('presenting')) {
+            addName(label.replace(/presenting/i, '').trim());
+        }
+    }
+
+    return names.slice(0, 20);
 }
 """
 

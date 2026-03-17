@@ -4,7 +4,7 @@ import traceback
 
 from .analyzer import MeetingAnalyzer
 from .config import PipelineConfig
-from .models import ChatMessage
+from .models import ChatMessage, TranscriptData
 from .reporting import render_report_markdown, render_transcript_markdown, write_json
 from .transcription import AudioTranscriber
 
@@ -15,6 +15,48 @@ class MeetingProcessingPipeline:
         self.config.ensure_dirs()
         self.transcriber = AudioTranscriber(config)
         self.analyzer = MeetingAnalyzer(config)
+
+    @staticmethod
+    def _apply_speaker_names(transcript: TranscriptData, participant_names: list[str]) -> TranscriptData:
+        if not participant_names or not transcript.segments:
+            return transcript
+
+        normalized_names = [str(name).strip() for name in participant_names if str(name).strip()]
+        if not normalized_names:
+            return transcript
+
+        # Preserve first-seen order of model speaker ids and map to participant names.
+        speaker_order: list[str] = []
+        for segment in transcript.segments:
+            label = (segment.speaker or "").strip()
+            if not label:
+                continue
+            if label not in speaker_order:
+                speaker_order.append(label)
+
+        # Avoid incorrect hard attribution: if we only have one detected speaker label
+        # but multiple participants were present, keep generic labels instead of forcing
+        # one participant name across all lines.
+        if len(speaker_order) <= 1 and len(normalized_names) > 1:
+            for segment in transcript.segments:
+                if (segment.speaker or "").strip():
+                    segment.speaker = "Unattributed Speaker"
+            return transcript
+
+        mapping: dict[str, str] = {}
+        for idx, label in enumerate(speaker_order):
+            if idx < len(normalized_names):
+                mapping[label] = normalized_names[idx]
+
+        if not mapping:
+            return transcript
+
+        for segment in transcript.segments:
+            label = (segment.speaker or "").strip()
+            if label in mapping:
+                segment.speaker = mapping[label]
+
+        return transcript
 
     def process(self, recording_path: str, chat_messages: list[dict] | None = None, metadata: dict | None = None) -> dict:
         metadata = metadata or {}
@@ -38,7 +80,15 @@ class MeetingProcessingPipeline:
 
         try:
             transcript = self.transcriber.transcribe(recording_path)
+            metadata["transcription_backend"] = self.transcriber.last_backend or "unknown"
+            participant_names = metadata.get("participant_names") or []
+            if isinstance(participant_names, list):
+                transcript = self._apply_speaker_names(transcript, participant_names)
+            metadata["analysis_backend"] = (
+                "openai" if self.config.openai_api_key else "gemini" if self.config.gemini_api_key else "rule-based"
+            )
             report = self.analyzer.analyze(transcript, normalized_chat, metadata)
+            metadata["analysis_backend"] = self.analyzer.last_backend or metadata["analysis_backend"]
 
             write_json(self.config.transcript_path, transcript.to_dict())
             write_json(self.config.analysis_path, report.to_dict())

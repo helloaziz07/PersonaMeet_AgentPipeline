@@ -3,6 +3,44 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+def _load_local_env_file() -> None:
+    """Load key=value pairs from project .env into os.environ if not already set."""
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    if not env_path.exists():
+        return
+
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if not key:
+                continue
+
+            # Remove optional wrapping quotes.
+            if (value.startswith('"') and value.endswith('"')) or (
+                value.startswith("'") and value.endswith("'")
+            ):
+                value = value[1:-1]
+
+            # Ignore inline comments for unquoted values.
+            if "#" in value and not any(q in raw_line for q in ['"', "'"]):
+                value = value.split("#", 1)[0].strip()
+
+            os.environ.setdefault(key, value)
+    except Exception:
+        # Non-fatal: runtime can still rely on shell-exported environment variables.
+        return
+
+
+# Ensure .env is loaded before dataclass defaults read environment variables.
+_load_local_env_file()
+
+
 @dataclass(slots=True)
 class PipelineConfig:
     base_dir: Path
@@ -16,6 +54,26 @@ class PipelineConfig:
     openai_api_key: str | None = os.getenv("OPENAI_API_KEY")
     gemini_api_key: str | None = os.getenv("GEMINI_API_KEY")
     gemini_model: str = os.getenv("PERSONA_GEMINI_MODEL", "gemini-1.5-flash")
+    # Sarvam AI is recommended for Hindi/Marathi/English with diarization.
+    sarvam_api_key: str | None = os.getenv("SARVAM_API_KEY")
+    sarvam_model: str = os.getenv("PERSONA_SARVAM_MODEL", "saaras:v3")
+    sarvam_mode: str = os.getenv("PERSONA_SARVAM_MODE", "transcribe")
+    sarvam_enable_diarization: bool = (
+        os.getenv("PERSONA_SARVAM_ENABLE_DIARIZATION", "false").strip().lower() in {"1", "true", "yes", "on"}
+    )
+    sarvam_chunk_seconds: float = float(os.getenv("PERSONA_SARVAM_CHUNK_SECONDS", "25"))
+    # Batch diarization path (preferred for multi-speaker attribution when supported by account/API).
+    sarvam_use_batch_diarization: bool = (
+        os.getenv("PERSONA_SARVAM_USE_BATCH_DIARIZATION", "true").strip().lower() in {"1", "true", "yes", "on"}
+    )
+    sarvam_batch_submit_url: str = os.getenv(
+        "PERSONA_SARVAM_BATCH_SUBMIT_URL", "https://api.sarvam.ai/speech-to-text/batch"
+    )
+    sarvam_batch_status_url_template: str = os.getenv(
+        "PERSONA_SARVAM_BATCH_STATUS_URL_TEMPLATE", "https://api.sarvam.ai/speech-to-text/batch/{job_id}"
+    )
+    sarvam_batch_poll_seconds: float = float(os.getenv("PERSONA_SARVAM_BATCH_POLL_SECONDS", "2.0"))
+    sarvam_batch_timeout_seconds: int = int(os.getenv("PERSONA_SARVAM_BATCH_TIMEOUT_SECONDS", "900"))
     # "small" is the minimum recommended model for Hindi/Marathi.
     # Override with: export PERSONA_LOCAL_WHISPER_MODEL=medium  (best quality, slower)
     local_whisper_model: str = os.getenv("PERSONA_LOCAL_WHISPER_MODEL", "small")

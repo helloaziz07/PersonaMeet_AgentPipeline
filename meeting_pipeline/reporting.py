@@ -17,8 +17,20 @@ def _format_seconds(total_seconds: float | None) -> str:
     return f"{minutes:02d}:{seconds:02d}"
 
 
+def _language_label(code: str | None) -> str:
+    if not code:
+        return "Unknown"
+    mapping = {
+        "hi": "Hindi",
+        "mr": "Marathi",
+        "en": "English",
+        "gu": "Gujarati",
+    }
+    return f"{code} ({mapping.get(code.lower(), 'Unmapped language')})"
+
+
 def write_json(path: Path, payload: dict | list) -> None:
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def render_transcript_markdown(transcript: TranscriptData, chat_messages: list[ChatMessage], metadata: dict) -> str:
@@ -27,8 +39,9 @@ def render_transcript_markdown(transcript: TranscriptData, chat_messages: list[C
         "",
         f"- Meeting URL: {metadata.get('meet_url', 'Unknown')}",
         f"- Bot Name: {metadata.get('bot_name', 'Unknown')}",
-        f"- Language: {transcript.language or 'Unknown'}",
+        f"- Language: {_language_label(transcript.language)}",
         f"- Duration: {_format_seconds(transcript.duration_seconds)}",
+        f"- Transcription Backend: {metadata.get('transcription_backend', 'Unknown')}",
         "",
         "## Audio Transcript",
         "",
@@ -64,7 +77,9 @@ def render_report_markdown(report: MeetingReport, metadata: dict) -> str:
         f"- Bot Name: {metadata.get('bot_name', 'Unknown')}",
         f"- Recording Path: {metadata.get('recording_path', 'Unknown')}",
         f"- Chat Messages Captured: {metadata.get('chat_count', 0)}",
-        f"- Transcript Language: {report.transcript_language or 'Unknown'}",
+        f"- Transcript Language: {_language_label(report.transcript_language)}",
+        f"- Transcription Backend: {metadata.get('transcription_backend', 'Unknown')}",
+        f"- Analysis Backend: {metadata.get('analysis_backend', 'Unknown')}",
         "",
         "## Important Highlights",
         "",

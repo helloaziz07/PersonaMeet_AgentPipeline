@@ -2,3 +2,5 @@ playwright>=1.51.0
 openai>=1.66.0
 faster-whisper>=1.1.1
 google-generativeai>=0.8.0
+requests>=2.31.0
+sarvamai>=0.1.0
