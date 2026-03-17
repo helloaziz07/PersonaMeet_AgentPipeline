@@ -402,12 +402,27 @@ class AudioTranscriber:
 
         client = SarvamAI(api_subscription_key=self.config.sarvam_api_key or "")
 
+        requested_model = (self.config.sarvam_model or "").strip()
+        if not requested_model:
+            raise TranscriptionError("Sarvam batch diarization requires PERSONA_SARVAM_MODEL to be set.")
+        create_job = client.speech_to_text_translate_job.create_job
         try:
-            job = client.speech_to_text_translate_job.create_job(
-                model=self.config.sarvam_model,
+            # Newer SDK variants may support `mode`; older versions reject it.
+            job = create_job(
+                model=requested_model,
                 mode=self.config.sarvam_mode,
                 with_diarization=True,
             )
+        except TypeError as exc:
+            if "unexpected keyword argument 'mode'" not in str(exc):
+                raise TranscriptionError(f"Sarvam batch create_job failed: {exc}") from exc
+            try:
+                job = create_job(
+                    model=requested_model,
+                    with_diarization=True,
+                )
+            except Exception as inner_exc:
+                raise TranscriptionError(f"Sarvam batch create_job failed: {inner_exc}") from inner_exc
         except Exception as exc:
             raise TranscriptionError(f"Sarvam batch create_job failed: {exc}") from exc
 
