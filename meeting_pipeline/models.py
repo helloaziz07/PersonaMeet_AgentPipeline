@@ -7,6 +7,8 @@ class TranscriptSegment:
     end: float
     text: str
     speaker: str | None = None
+    speaker_source: str | None = None
+    speaker_confidence: float | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -92,3 +94,17 @@ class MeetingReport:
             "transcript_language": self.transcript_language,
             "summary_note": self.summary_note,
         }
+
+
+@dataclass(slots=True)
+class SpeakerEventInterval:
+    """A time interval during which a specific participant was the active speaker."""
+
+    speaker: str
+    start_ms: float
+    end_ms: float
+    source: str = "unknown"
+    confidence: float = 0.5
+
+    def to_dict(self) -> dict:
+        return asdict(self)

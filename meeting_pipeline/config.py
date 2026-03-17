@@ -88,6 +88,22 @@ class PipelineConfig:
     synthetic_speaker_count: int = int(os.getenv("PERSONA_SYNTHETIC_SPEAKER_COUNT", "2"))
     speaker_turn_gap_seconds: float = float(os.getenv("PERSONA_SPEAKER_TURN_GAP_SECONDS", "1.6"))
     max_chunk_chars: int = 12000
+    # ── Active-speaker tracking + overlap attribution ─────────────────────
+    # Poll the Meet UI every PERSONA_MEET_SPEAKER_POLL_MS ms in-browser to
+    # capture who is speaking.  Intervals shorter than STABILITY_MS are
+    # discarded (avoids noise from brief focus transitions).
+    active_speaker_tracking: bool = (
+        os.getenv("PERSONA_MEET_ACTIVE_SPEAKER_TRACKING", "true").strip().lower() in {"1", "true", "yes", "on"}
+    )
+    speaker_poll_ms: int = int(os.getenv("PERSONA_MEET_SPEAKER_POLL_MS", "200"))
+    speaker_stability_ms: int = int(os.getenv("PERSONA_MEET_SPEAKER_STABILITY_MS", "500"))
+    # When True, the overlap engine replaces the first-seen-order name mapping.
+    attribution_enabled: bool = (
+        os.getenv("PERSONA_MEET_NAME_ATTRIBUTION_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+    )
+    # Segments whose best speaker-overlap fraction is below this threshold are
+    # kept without a real name (speaker_source = "diarization-only").
+    attribution_min_confidence: float = float(os.getenv("PERSONA_MEET_ATTRIBUTION_MIN_CONFIDENCE", "0.45"))
 
     def __post_init__(self) -> None:
         self.base_dir = Path(self.base_dir)

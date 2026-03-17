@@ -6,6 +6,7 @@ from .analyzer import MeetingAnalyzer
 from .config import PipelineConfig
 from .models import ChatMessage, TranscriptData
 from .reporting import render_report_markdown, render_transcript_markdown, write_json
+from .speaker_attribution import SpeakerAttributionEngine
 from .transcription import AudioTranscriber
 
 
@@ -81,9 +82,18 @@ class MeetingProcessingPipeline:
         try:
             transcript = self.transcriber.transcribe(recording_path)
             metadata["transcription_backend"] = self.transcriber.last_backend or "unknown"
+            speaker_events = metadata.get("speaker_events") or []
             participant_names = metadata.get("participant_names") or []
-            if isinstance(participant_names, list):
+            if speaker_events and self.config.attribution_enabled:
+                engine = SpeakerAttributionEngine(
+                    min_confidence=self.config.attribution_min_confidence
+                )
+                transcript = engine.attribute(transcript, speaker_events)
+                metadata["speaker_attribution"] = "overlap-engine"
+                metadata["speaker_events_count"] = len(speaker_events)
+            elif isinstance(participant_names, list) and participant_names:
                 transcript = self._apply_speaker_names(transcript, participant_names)
+                metadata["speaker_attribution"] = "first-seen-order"
             metadata["analysis_backend"] = (
                 "openai" if self.config.openai_api_key else "gemini" if self.config.gemini_api_key else "rule-based"
             )

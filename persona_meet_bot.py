@@ -5,6 +5,8 @@ PersonaMeet Bot — Joins a Google Meet, records audio, and plays an audio file 
 import asyncio
 import sys
 import os
+import json
+import re
 import shutil
 import base64
 import signal
@@ -60,8 +62,11 @@ class PersonaMeetBot:
         self._audio_data_url: str | None = None
         self.chat_messages: list[dict] = []
         self.participant_names: list[str] = []
-        self._chat_seen_keys: set[tuple[str | None, str, str | None]] = set()
+        self._chat_seen_recent: dict[tuple[str | None, str], float] = {}
+        self._chat_duplicate_window_seconds: float = 120.0
         self._chat_capture_task = None
+        self._participant_refresh_task = None
+        self.speaker_events: list[dict] = []
         self.session_started_monotonic: float | None = None
         self.session_dir = os.path.join(
             os.getcwd(),
@@ -436,6 +441,7 @@ class PersonaMeetBot:
                 if started:
                     self.recording_active = True
                     log("Recording started")
+                    await self._start_speaker_tracking()
                     return
             except Exception:
                 pass
@@ -447,6 +453,7 @@ class PersonaMeetBot:
             self.recording_active = started
             if started:
                 log("Recording started (awaiting participants)")
+                await self._start_speaker_tracking()
         except Exception as e:
             log_error(f"Recording start failed: {e}")
 
@@ -467,6 +474,7 @@ class PersonaMeetBot:
             await self._open_chat_panel()
             await self._capture_participant_names()
             self._chat_capture_task = asyncio.create_task(self._capture_chat_messages())
+            self._participant_refresh_task = asyncio.create_task(self._refresh_participant_names_loop())
 
             if not self.bot_active:
                 return
@@ -624,6 +632,22 @@ class PersonaMeetBot:
         except Exception as e:
             log_error(f"Error saving recording: {e}")
 
+        # Stop speaker tracking and save events for post-processing attribution.
+        try:
+            events = await self.page.evaluate("() => window.__personaMeetBot.stopSpeakerTracking()")
+            if not isinstance(events, list):
+                events = []
+            self.speaker_events = events
+            events_path = os.path.join(self.session_dir, "speaker_events.json")
+            with open(events_path, "w", encoding="utf-8") as f:
+                json.dump(events, f, indent=2, ensure_ascii=False)
+            if events:
+                log(f"Speaker events saved: {len(events)} intervals → speaker_events.json")
+            else:
+                log("Speaker tracking: no events captured (saved empty speaker_events.json)")
+        except Exception as e:
+            log(f"Speaker tracking stop (non-fatal): {e}")
+
         self.recording_active = False
 
     async def _open_chat_panel(self):
@@ -634,6 +658,20 @@ class PersonaMeetBot:
                 log("Chat panel opened")
         except Exception:
             pass
+
+    async def _start_speaker_tracking(self):
+        """Start in-page speaker tracking right after recording begins."""
+        config = PipelineConfig(base_dir=self.session_dir)
+        if not config.active_speaker_tracking:
+            return
+        try:
+            await self.page.evaluate(
+                "({p, s}) => window.__personaMeetBot.startSpeakerTracking(p, s)",
+                {"p": config.speaker_poll_ms, "s": config.speaker_stability_ms},
+            )
+            log(f"Speaker tracking started (poll={config.speaker_poll_ms}ms, stability={config.speaker_stability_ms}ms)")
+        except Exception as e:
+            log(f"Speaker tracking start (non-fatal): {e}")
 
     async def _capture_participant_names(self):
         try:
@@ -666,6 +704,13 @@ class PersonaMeetBot:
         except Exception:
             pass
 
+    async def _refresh_participant_names_loop(self):
+        """Periodically re-captures participant names so late joiners are included."""
+        await asyncio.sleep(30)  # initial delay — let the meeting settle first
+        while self.bot_active:
+            await self._capture_participant_names()
+            await asyncio.sleep(30)
+
     async def _capture_chat_messages(self):
         while self.bot_active:
             try:
@@ -688,11 +733,22 @@ class PersonaMeetBot:
             if not text:
                 continue
 
-            key = (author, text, captured_at)
-            if key in self._chat_seen_keys:
+            # Meet often includes message clock text (e.g. "5:10 PM Hello") in
+            # extracted rows depending on DOM shape. Strip a leading time prefix
+            # so dedupe and downstream report text stay clean.
+            text = re.sub(r"^\s*\d{1,2}:\d{2}\s*[APMapm\u202f ]*\s+", "", text).strip()
+            if not text:
                 continue
 
-            self._chat_seen_keys.add(key)
+            stable_key = (author, text)
+            if now_relative is not None:
+                last_seen = self._chat_seen_recent.get(stable_key)
+                if last_seen is not None and (now_relative - last_seen) < self._chat_duplicate_window_seconds:
+                    continue
+                self._chat_seen_recent[stable_key] = now_relative
+            elif stable_key in self._chat_seen_recent:
+                continue
+
             self.chat_messages.append(
                 {
                     "author": author,
@@ -736,6 +792,7 @@ class PersonaMeetBot:
             "meet_url": self.meet_url,
             "bot_name": self.bot_name,
             "participant_names": self.participant_names,
+            "speaker_events": self.speaker_events,
         }
 
         try:
@@ -761,6 +818,12 @@ class PersonaMeetBot:
             self._chat_capture_task.cancel()
             try:
                 await self._chat_capture_task
+            except BaseException:
+                pass
+        if self._participant_refresh_task:
+            self._participant_refresh_task.cancel()
+            try:
+                await self._participant_refresh_task
             except BaseException:
                 pass
 

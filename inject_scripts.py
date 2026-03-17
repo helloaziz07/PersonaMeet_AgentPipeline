@@ -366,6 +366,102 @@ INIT_SCRIPT = r"""
     }
 
     // ═══════════════════════════════════════
+    // SECTION 5: Speaker Tracking System
+    // Polls the DOM every ~200 ms to detect who is speaking in Meet.
+    // Events are stored relative to recordingStartPerfMs so they can be
+    // correlated with Sarvam diarization segment timestamps.
+    // ═══════════════════════════════════════
+    let speakerTrackingActive = false;
+    let speakerTrackingTimerId = null;
+    let speakerEvents = [];           // [{speaker, start_ms, end_ms, source, confidence}]
+    let recordingStartPerfMs = null;  // performance.now() snapshot when recording starts
+    let _curSpeakerName = null;
+    let _curSpeakerStartMs = null;
+    let _curSpeakerSrc = 'none';
+    let _curSpeakerConf = 0.0;
+    let _pollMs = 200;
+    let _stabilityMs = 500;  // discard intervals shorter than this (ms)
+
+    function _detectActiveSpeaker() {
+        // Strategy 1 — [data-active-speaker="true"] tile overlay
+        const activeTile = document.querySelector('[data-active-speaker="true"]');
+        if (activeTile) {
+            for (const sel of ['[data-self-name]', '[jsname="r4nke"]', '.zWfAib', '.GvcuGe', 'div[title]', 'span[dir="auto"]']) {
+                const el = activeTile.querySelector(sel);
+                if (el) {
+                    const n = (el.getAttribute('data-self-name') || el.getAttribute('title') || el.innerText || '').trim();
+                    if (n && n.length >= 2 && n.length < 80) return { name: n, source: 's1-active-tile', confidence: 0.9 };
+                }
+            }
+        }
+
+        // Strategy 2 — aria-label "[name] is speaking" / "[name] speaking now"
+        for (const el of document.querySelectorAll('[aria-label]')) {
+            const lbl = (el.getAttribute('aria-label') || '').trim();
+            const m = lbl.match(/^(.+?)\s+(?:is\s+)?speaking(?:\s+now)?(?:\s|$)/i);
+            if (m && m[1] && m[1].trim().length >= 2 && m[1].trim().length < 80) {
+                return { name: m[1].trim(), source: 's2-aria-speaking', confidence: 0.88 };
+            }
+        }
+
+        // Strategy 3 — data-speaker-name attribute
+        const snEl = document.querySelector('[data-speaker-name]');
+        if (snEl) {
+            const n = (snEl.getAttribute('data-speaker-name') || '').trim();
+            if (n && n.length >= 2 && n.length < 80) return { name: n, source: 's3-data-speaker-name', confidence: 0.85 };
+        }
+
+        // Strategy 4 — speaking-wave indicator → walk up to participant container
+        for (const indicatorSel of ['[jsname="EgEpXe"]', '[data-is-speaking="true"]']) {
+            try {
+                const ind = document.querySelector(indicatorSel);
+                if (ind) {
+                    const cont = ind.closest('[data-participant-id], [data-requested-participant-id]');
+                    if (cont) {
+                        for (const nSel of ['[data-self-name]', '[jsname="r4nke"]', 'span[dir="auto"]']) {
+                            const ne = cont.querySelector(nSel);
+                            const n = ne && (ne.getAttribute('data-self-name') || ne.innerText || '').trim();
+                            if (n && n.length >= 2 && n.length < 80) return { name: n, source: 's4-indicator', confidence: 0.75 };
+                        }
+                    }
+                }
+            } catch (_) {}
+        }
+
+        return null;
+    }
+
+    function _flushSpeakerInterval(endMs) {
+        if (!_curSpeakerName || _curSpeakerStartMs === null) return;
+        const dur = endMs - _curSpeakerStartMs;
+        if (dur >= _stabilityMs) {
+            speakerEvents.push({
+                speaker: _curSpeakerName,
+                start_ms: Math.round(_curSpeakerStartMs),
+                end_ms: Math.round(endMs),
+                source: _curSpeakerSrc,
+                confidence: _curSpeakerConf,
+            });
+        }
+    }
+
+    function _speakerPollTick() {
+        if (!speakerTrackingActive) return;
+        const nowMs = recordingStartPerfMs !== null
+            ? (performance.now() - recordingStartPerfMs)
+            : performance.now();
+        const det = _detectActiveSpeaker();
+        const name = det ? det.name : null;
+        if (name !== _curSpeakerName) {
+            _flushSpeakerInterval(nowMs);
+            _curSpeakerName = name;
+            _curSpeakerStartMs = nowMs;
+            _curSpeakerSrc = det ? det.source : 'none';
+            _curSpeakerConf = det ? det.confidence : 0.0;
+        }
+    }
+
+    // ═══════════════════════════════════════
     // SECTION 4: API exposed to Playwright
     // (called via page.evaluate)
     // ═══════════════════════════════════════
@@ -437,6 +533,7 @@ INIT_SCRIPT = r"""
                 mediaRecorder.onerror = (e) => console.error(LOG, 'Recorder error:', e.error || e);
                 mediaRecorder.start(3000);  // chunk every 3 s (same as offscreen.js)
                 isRecording = true;
+                recordingStartPerfMs = performance.now();
                 console.log(LOG, 'Recording started (' + mime + '), connected tracks:', connectedTrackIds.size);
                 return true;
             } catch (err) {
@@ -483,6 +580,49 @@ INIT_SCRIPT = r"""
                 totalBytes: totalRecBytes,
                 connectedTracks: connectedTrackIds.size,
                 isSpeaking
+            };
+        },
+
+        // ── Speaker tracking ──────────────────────────
+        startSpeakerTracking: function (pollMs, stabilityMs) {
+            if (speakerTrackingActive) return true;
+            _pollMs = (typeof pollMs === 'number' && pollMs > 0) ? pollMs : 200;
+            _stabilityMs = (typeof stabilityMs === 'number' && stabilityMs > 0) ? stabilityMs : 500;
+            speakerTrackingActive = true;
+            speakerEvents = [];
+            _curSpeakerName = null;
+            _curSpeakerStartMs = null;
+            speakerTrackingTimerId = setInterval(_speakerPollTick, _pollMs);
+            console.log(LOG, 'Speaker tracking started (poll=' + _pollMs + 'ms, stability=' + _stabilityMs + 'ms)');
+            return true;
+        },
+
+        stopSpeakerTracking: function () {
+            if (!speakerTrackingActive) return speakerEvents.slice();
+            speakerTrackingActive = false;
+            if (speakerTrackingTimerId !== null) {
+                clearInterval(speakerTrackingTimerId);
+                speakerTrackingTimerId = null;
+            }
+            // Flush any in-progress segment
+            const nowMs = recordingStartPerfMs !== null
+                ? (performance.now() - recordingStartPerfMs)
+                : performance.now();
+            _flushSpeakerInterval(nowMs);
+            console.log(LOG, 'Speaker tracking stopped, total intervals:', speakerEvents.length);
+            return speakerEvents.slice();
+        },
+
+        getSpeakerEvents: function () {
+            return speakerEvents.slice();
+        },
+
+        getRecordingClockInfo: function () {
+            return {
+                recordingStartPerfMs: recordingStartPerfMs,
+                currentPerfMs: performance.now(),
+                elapsedMs: recordingStartPerfMs !== null ? (performance.now() - recordingStartPerfMs) : null,
+                isRecording: isRecording,
             };
         }
     };
@@ -604,39 +744,74 @@ JS_GET_CHAT_MESSAGES = r"""
 () => {
     const messages = [];
     const seen = new Set();
-    const selectors = [
-        '[role="listitem"]',
+    const now = new Date().toISOString();
+    const lowIgnore = ['send a message', 'chat with everyone', 'message everyone', 'pin a message'];
+
+    function addMessage(author, body) {
+        if (!body || body.trim().length < 2) return;
+        body = body.trim();
+        const lc = body.toLowerCase();
+        if (lowIgnore.some(s => lc.includes(s))) return;
+        const key = (author || '') + '|' + body;
+        if (seen.has(key)) return;
+        seen.add(key);
+        messages.push({ author: author ? author.trim() : null, text: body, captured_at: now });
+    }
+
+    function splitIntoAuthorBody(el) {
+        // Try dedicated author + body sub-elements first
+        const authorEl = el.querySelector(
+            '[data-sender-name], [jsname="r4nke"], [aria-label][role="heading"], .NhAade'
+        );
+        const bodyEl = el.querySelector(
+            '[jsname="MZArnb"], [data-message-text], .oIy2qc, [role="paragraph"]'
+        );
+        if (authorEl && bodyEl) {
+            const a = (authorEl.getAttribute('data-sender-name') || authorEl.innerText || '').trim();
+            const b = (bodyEl.innerText || '').trim();
+            if (b) return { author: a || null, body: b };
+        }
+        // Fallback: split innerText by newlines
+        const full = (el.innerText || '').trim();
+        if (!full) return null;
+        const lines = full.split(/\n+/).map(s => s.trim()).filter(Boolean);
+        if (lines.length >= 2) return { author: lines[0], body: lines.slice(1).join(' ') };
+        return { author: null, body: full };
+    }
+
+    // Strategy 1: explicit message-container selectors (current & past Meet UI)
+    const containerSelectors = [
+        '[jsname="xySENc"]',
         '[data-message-id]',
         '[data-chat-message-id]',
+        '[jscontroller][role="row"]',
+        '[role="listitem"]',
     ];
+    for (const sel of containerSelectors) {
+        for (const el of document.querySelectorAll(sel)) {
+            const parsed = splitIntoAuthorBody(el);
+            if (parsed) addMessage(parsed.author, parsed.body);
+        }
+        if (messages.length > 0) break;  // first successful selector wins
+    }
 
-    for (const selector of selectors) {
-        for (const el of document.querySelectorAll(selector)) {
-            const text = (el.innerText || '').trim();
-            if (!text || text.length < 2) continue;
-
-            const lowered = text.toLowerCase();
-            if (lowered.includes('send a message') || lowered.includes('chat with everyone')) continue;
-
-            const lines = text.split(/\n+/).map(item => item.trim()).filter(Boolean);
-            if (!lines.length) continue;
-
-            let author = null;
-            let body = text;
-            if (lines.length >= 2) {
-                author = lines[0];
-                body = lines.slice(1).join(' ');
+    // Strategy 2: fall back to scanning the chat panel container
+    if (messages.length === 0) {
+        const chatPanel = document.querySelector(
+            '[aria-label*="chat" i], [data-tab-id="2"], [jsname="VpmEpb"], [jsname="vAFyG"]'
+        );
+        if (chatPanel) {
+            for (const el of chatPanel.querySelectorAll('div, li')) {
+                const text = (el.innerText || '').trim();
+                if (!text || text.length < 2 || el.children.length > 6) continue;
+                const lc = text.toLowerCase();
+                if (lowIgnore.some(s => lc.includes(s))) continue;
+                const lines = text.split(/\n+/).map(s => s.trim()).filter(Boolean);
+                if (!lines.length) continue;
+                const author = lines.length >= 2 ? lines[0] : null;
+                const body = lines.length >= 2 ? lines.slice(1).join(' ') : lines[0];
+                addMessage(author, body);
             }
-
-            const key = `${author || ''}|${body}`;
-            if (seen.has(key)) continue;
-            seen.add(key);
-
-            messages.push({
-                author,
-                text: body,
-                captured_at: new Date().toISOString(),
-            });
         }
     }
 
